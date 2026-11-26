@@ -74,7 +74,7 @@ async function startWhatsApp() {
       auth: state,
       logger,
       printQRInTerminal: false,
-      browser: ['ThinkerASHU AI', 'Chrome', '1.0.0'],
+      browser: ['Ubuntu', 'Chrome', '20.0.04'],
       syncFullHistory: false
     });
 

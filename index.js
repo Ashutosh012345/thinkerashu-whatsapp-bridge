@@ -1,180 +1,309 @@
-﻿const express = require('express');
+const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
-const cors = require('cors');
-const pino = require('pino');
 const fs = require('fs');
+const path = require('path');
 const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
-  fetchLatestBaileysVersion
+  fetchLatestBaileysVersion,
+  downloadContentFromMessage
 } = require('@whiskeysockets/baileys');
 
+let logger;
+try {
+  logger = require('pino')({ level: 'silent' });
+} catch {
+  logger = undefined;
+}
+
 const app = express();
-app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/ws' });
 
-let sock = null;
-let connectionStatus = 'Disconnected';
-const processedIds = new Set();
-const lastReplyTime = new Map();
+const PORT = process.env.PORT || 3000;
+const AUTH_DIR = path.join(__dirname, 'auth_info');
 
-function broadcast(data) {
-  const payload = JSON.stringify(data);
+let sock = null;
+let connectionStatus = 'disconnected'; // disconnected | connecting | connected
+let isStarting = false;
+
+// In-memory media reference cache (capped at 50 items to stay well under Render's 512MB RAM)
+const mediaStore = new Map();
+function saveMediaRef(id, type, mediaObj, mimetype) {
+  if (mediaStore.size >= 50) {
+    mediaStore.delete(mediaStore.keys().next().value);
+  }
+  mediaStore.set(id, { type, mediaObj, mimetype });
+}
+
+function broadcast(payload) {
+  const data = JSON.stringify(payload);
   wss.clients.forEach((client) => {
     if (client.readyState === WebSocket.OPEN) {
-      client.send(payload);
+      client.send(data);
     }
   });
 }
 
-wss.on('connection', (ws) => {
-  wss.clients.forEach((client) => {
-    if (client !== ws && client.readyState === WebSocket.OPEN) {
-      client.close();
-    }
-  });
-  ws.send(JSON.stringify({ type: 'status', status: connectionStatus }));
-});
+function extractText(m) {
+  if (!m) return '';
+  return (
+    m.conversation ||
+    m.extendedTextMessage?.text ||
+    m.imageMessage?.caption ||
+    m.videoMessage?.caption ||
+    m.documentMessage?.caption ||
+    ''
+  );
+}
 
 async function startWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
-  const { version } = await fetchLatestBaileysVersion();
+  if (isStarting) return;
+  isStarting = true;
 
-  sock = makeWASocket({
-    version,
-    logger: pino({ level: 'silent' }),
-    auth: state,
-    printQRInTerminal: false,
-    browser: ['Ubuntu', 'Chrome', '20.0.04']
-  });
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+    const { version } = await fetchLatestBaileysVersion();
 
-  sock.ev.on('creds.update', saveCreds);
+    sock = makeWASocket({
+      version,
+      auth: state,
+      logger,
+      printQRInTerminal: false,
+      browser: ['ThinkerASHU AI', 'Chrome', '1.0.0'],
+      syncFullHistory: false
+    });
 
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect } = update;
-    if (connection === 'open') {
-      connectionStatus = 'Connected';
-      broadcast({ type: 'status', status: 'Connected' });
-      console.log('WhatsApp Connected!');
-    } else if (connection === 'close') {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      connectionStatus = 'Disconnected';
-      broadcast({ type: 'status', status: 'Disconnected' });
-      if (code !== DisconnectReason.loggedOut) {
-        setTimeout(startWhatsApp, 3000);
-      }
-    }
-  });
+    sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect } = update;
 
-    for (const msg of messages) {
-      if (!msg.message || msg.key.fromMe) continue;
-
-      const msgId = msg.key.id;
-      if (processedIds.has(msgId)) continue;
-      processedIds.add(msgId);
-      setTimeout(() => processedIds.delete(msgId), 60000);
-
-      const text =
-        msg.message.conversation ||
-        msg.message.extendedTextMessage?.text ||
-        '';
-      if (!text.trim()) continue;
-
-      if (msg.key.remoteJid === 'status@broadcast') {
+      if (connection === 'connecting') {
+        connectionStatus = 'connecting';
+        broadcast({ event: 'connection.update', status: 'connecting', connected: false });
+      } else if (connection === 'open') {
+        connectionStatus = 'connected';
+        console.log('WhatsApp connected');
         broadcast({
-          type: 'status.new',
-          sender: msg.pushName || msg.key.participant,
-          caption: text,
-          timestamp: Date.now()
+          event: 'connection.update',
+          status: 'connected',
+          connected: true,
+          user: sock.user
         });
-      } else {
+      } else if (connection === 'close') {
+        connectionStatus = 'disconnected';
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const loggedOut = statusCode === DisconnectReason.loggedOut;
+
+        console.log('WhatsApp disconnected. Code:', statusCode);
+        broadcast({ event: 'connection.update', status: 'disconnected', connected: false });
+
+        if (loggedOut) {
+          fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+        }
+        setTimeout(() => startWhatsApp(), 3000);
+      }
+    });
+
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return; // Ignore old history syncs
+
+      for (const msg of messages) {
+        if (!msg.message) continue;
+        if (msg.key.fromMe) continue; // CRITICAL: Prevent infinite self-reply loops
+        if (msg.key.remoteJid === 'status@broadcast') continue;
+
+        const jid = msg.key.remoteJid;
+        const msgId = msg.key.id;
+        const senderName = msg.pushName || jid.split('@')[0];
+        const text = extractText(msg.message);
+
+        // Extra loop-breaker guard
+        if (text.toLowerCase().includes('this reply is generated by thinkerashu ai')) {
+          continue;
+        }
+
+        let mediaPayload = {};
+        const mediaTypes = [
+          { key: 'imageMessage', type: 'image' },
+          { key: 'audioMessage', type: 'audio' },
+          { key: 'videoMessage', type: 'video' }
+        ];
+
+        for (const { key, type: mType } of mediaTypes) {
+          if (msg.message[key]) {
+            const mediaObj = msg.message[key];
+            const mimetype =
+              mediaObj.mimetype ||
+              (mType === 'image' ? 'image/jpeg' : mType === 'audio' ? 'audio/ogg' : 'video/mp4');
+            const fileSize = Number(mediaObj.fileLength || 0);
+
+            saveMediaRef(msgId, mType, mediaObj, mimetype);
+
+            mediaPayload = {
+              mediaType: mType,
+              mimeType: mimetype,
+              fileSize,
+              mediaUrl: `/api/media/${msgId}`
+            };
+
+            // Forward images and voice notes under 4MB as base64 for AI multimodal understanding
+            if ((mType === 'image' || mType === 'audio') && fileSize < 4 * 1024 * 1024) {
+              try {
+                const stream = await downloadContentFromMessage(mediaObj, mType);
+                const chunks = [];
+                for await (const chunk of stream) chunks.push(chunk);
+                mediaPayload.mediaBase64 = Buffer.concat(chunks).toString('base64');
+              } catch (err) {
+                console.error('Media base64 download failed:', err.message);
+              }
+            }
+            break;
+          }
+        }
+
         broadcast({
-          type: 'message.new',
+          event: 'message.new',
           id: msgId,
-          jid: msg.key.remoteJid,
-          sender: msg.pushName || msg.key.remoteJid,
+          jid,
+          senderName,
           text,
-          timestamp: Date.now()
+          timestamp: Number(msg.messageTimestamp || Math.floor(Date.now() / 1000)) * 1000,
+          isFromMe: false,
+          isGroup: jid.endsWith('@g.us'),
+          ...mediaPayload
         });
       }
-    }
-  });
+    });
+  } catch (err) {
+    console.error('Failed to start WhatsApp:', err);
+    setTimeout(() => startWhatsApp(), 5000);
+  } finally {
+    isStarting = false;
+  }
 }
 
-app.get('/', (req, res) => {
-  res.json({ status: connectionStatus, server: 'ThinkerASHU Bridge Running' });
+// WebSocket connection handler
+wss.on('connection', (ws) => {
+  ws.send(
+    JSON.stringify({
+      event: 'connection.update',
+      status: connectionStatus,
+      connected: connectionStatus === 'connected',
+      user: sock?.user || null
+    })
+  );
 });
 
+// Health & status endpoints
+app.get('/', (req, res) => {
+  res.json({ service: 'ThinkerASHU WhatsApp Bridge', status: connectionStatus });
+});
+
+app.get('/api/status', (req, res) => {
+  res.json({
+    status: connectionStatus,
+    connected: connectionStatus === 'connected',
+    user: sock?.user || null
+  });
+});
+
+// Request 8-digit pairing code
 app.post('/api/pair', async (req, res) => {
   try {
-    const rawPhone = String(req.body.phoneNumber || req.body.phone || '').replace(/\D/g, '');
-    if (!rawPhone) return res.status(400).json({ error: 'Valid phone number required' });
-
-    if (!sock) await startWhatsApp();
-    if (sock.authState.creds.registered) {
+    if (connectionStatus === 'connected') {
       return res.json({ status: 'Already Connected', code: null });
     }
-
-    connectionStatus = 'Pairing';
-    broadcast({ type: 'status', status: 'Pairing' });
-
-    const code = await sock.requestPairingCode(rawPhone);
-    const formatted = code?.match(/.{1,4}/g)?.join('-') || code;
-    res.json({ code: formatted, pairingCode: formatted });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/send-message', async (req, res) => {
-  try {
-    const { recipient, messageText, jid, text } = req.body;
-    const target = jid || (recipient.includes('@') ? recipient : `${recipient.replace(/\D/g, '')}@s.whatsapp.net`);
-
-    const now = Date.now();
-    if (now - (lastReplyTime.get(target) || 0) < 5000) {
-      return res.json({ success: true, skipped: 'cooldown' });
+    if (!sock) {
+      await startWhatsApp();
     }
-    lastReplyTime.set(target, now);
 
-    await sock.sendMessage(target, { text: messageText || text });
-    res.json({ success: true });
+    const rawPhone = req.body.phone || req.body.phoneNumber || '';
+    const phone = String(rawPhone).replace(/[^0-9]/g, '');
+    if (!phone) {
+      return res.status(400).json({ error: 'Phone number is required' });
+    }
+
+    const code = await sock.requestPairingCode(phone);
+    res.json({ status: 'Pairing', code });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Pairing error:', err);
+    res.status(500).json({ error: err.message || 'Failed to generate pairing code', code: null });
   }
 });
 
-app.get('/api/groups', async (req, res) => {
-  try {
-    const groups = await sock.groupFetchAllParticipating();
-    res.json({ groups: Object.values(groups) });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
+// Clean logout & session wipe
 app.post('/api/logout', async (req, res) => {
   try {
-    if (sock) await sock.logout();
-    fs.rmSync('./auth_info', { recursive: true, force: true });
-    connectionStatus = 'Disconnected';
-    broadcast({ type: 'status', status: 'Disconnected' });
-    res.json({ success: true });
+    if (sock) {
+      try {
+        await sock.logout();
+      } catch {}
+      try {
+        sock.end();
+      } catch {}
+      sock = null;
+    }
+    connectionStatus = 'disconnected';
+    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+    broadcast({ event: 'connection.update', status: 'disconnected', connected: false });
+
+    setTimeout(() => startWhatsApp(), 1500);
+    res.json({ success: true, status: 'disconnected' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Bridge server running on port ${PORT}`);
+// Send WhatsApp text message
+app.post('/api/send-message', async (req, res) => {
+  try {
+    if (!sock || connectionStatus !== 'connected') {
+      return res.status(503).json({ error: 'WhatsApp is not connected' });
+    }
+    const { jid, text } = req.body;
+    if (!jid || !text) {
+      return res.status(400).json({ error: 'jid and text are required' });
+    }
+
+    const sent = await sock.sendMessage(jid, { text });
+    res.json({ success: true, id: sent?.key?.id || null });
+  } catch (err) {
+    console.error('Send message error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// On-demand HTTP streaming for images, voice notes, and 100MB+ videos
+app.get('/api/media/:id', async (req, res) => {
+  const item = mediaStore.get(req.params.id);
+  if (!item) {
+    return res.status(404).json({ error: 'Media expired or not found' });
+  }
+
+  try {
+    res.setHeader('Content-Type', item.mimetype);
+    const stream = await downloadContentFromMessage(item.mediaObj, item.type);
+    for await (const chunk of stream) {
+      if (!res.write(chunk)) {
+        await new Promise((resolve) => res.once('drain', resolve));
+      }
+    }
+    res.end();
+  } catch (err) {
+    console.error('Media stream error:', err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to stream media' });
+    }
+  }
+});
+
+server.listen(PORT, () => {
+  console.log(`ThinkerASHU Bridge running on port ${PORT}`);
   startWhatsApp();
 });
